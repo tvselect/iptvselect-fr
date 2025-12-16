@@ -1,19 +1,50 @@
-import subprocess
-import readline
-import shlex
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import getpass
 import logging
 import os
-
+import re
+import stat
+import sys
 from configparser import ConfigParser
+from pathlib import Path
+
+# --- Configuration for paths and permissions ---
+HOME = Path.home()
+BASE_CONFIG_DIR = HOME / ".config" / "iptvselect-fr"
+PROVIDERS_DIR = BASE_CONFIG_DIR / "iptv_providers"
+LOG_DIR = HOME / ".local" / "share" / "iptvselect-fr" / "logs"
+LOG_FILE = LOG_DIR / "configparser.log"
+CONF_FILE = BASE_CONFIG_DIR / "iptv_select_conf.ini"
+
+# Ensure directories exist with conservative permissions (owner rwx only)
+def ensure_dir(path: Path, mode: int = 0o700) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+        # Some systems ignore mode on exist_ok; force it
+        path.chmod(mode)
+    except Exception:
+        print(f"Impossible de créer ou configurer le répertoire : {path}")
+        sys.exit(1)
+
+
+ensure_dir(LOG_DIR, mode=0o700)
+ensure_dir(PROVIDERS_DIR, mode=0o700)
+ensure_dir(BASE_CONFIG_DIR, mode=0o700)
 
 logging.basicConfig(
-    filename=os.path.expanduser("~/.local/share/iptvselect-fr/logs/configparser.log"),
+    filename=str(LOG_FILE),
     format="%(asctime)s %(levelname)s: %(message)s",
     level=logging.INFO,
     filemode="a",
 )
 
-user = os.environ.get("USER")
+try:
+    user = getpass.getuser()
+except Exception:
+    user = os.environ.get("USER", "")
+    if not user:
+        user = "unknown"
 
 config_object = ConfigParser()
 
@@ -51,76 +82,113 @@ while answer.lower() not in answers:
     )
 
 if answer.lower() == "non":
-    exit()
+    sys.exit(0)
 
 record_ranking = ["première", "deuxième", "troisième", "quatrième"]
 provider_rank = 0
 answers_apps = [1, 2, 3, 4]
 recorders = ["ffmpeg", "vlc", "mplayer", "streamlink"]
-provider_recorder = 5
-backup_recorder = 5
+provider_recorder = 666
+backup_recorder = 666
+
+# Allowed provider name pattern: letters, digits, dot, underscore, hyphen
+VALID_PROVIDER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def sanitize_provider_name(name: str) -> str:
+    """Return stripped name if allowed, else empty string."""
+    if not name:
+        return ""
+    name = name.strip()
+    # Reject any path components or traversal attempts
+    if "/" in name or "\\" in name or ".." in name:
+        return ""
+    if not VALID_PROVIDER_RE.match(name):
+        return ""
+    return name
+
+
+def provider_path_from_name(name: str) -> Path:
+    """Return resolved provider path and ensure it's under PROVIDERS_DIR."""
+    candidate = (PROVIDERS_DIR / f"{name}.ini").expanduser()
+    try:
+        # Resolve to the real absolute path
+        resolved = candidate.resolve(strict=False)
+    except Exception:
+        # If resolve fails for some reason, return non-existent candidate
+        resolved = candidate.absolute()
+    # Ensure resolved path is a child of PROVIDERS_DIR (prevents symlink escape)
+    try:
+        prov_resolved = PROVIDERS_DIR.resolve(strict=True)
+    except Exception:
+        prov_resolved = PROVIDERS_DIR.absolute()
+    # Compare common paths
+    try:
+        if os.path.commonpath([str(resolved), str(prov_resolved)]) != str(prov_resolved):
+            return Path()  # invalid/escape attempt
+    except Exception:
+        return Path()
+    return resolved
+
 
 while True:
     while True:
         iptv_provider = input(
             "\nQuel est le fournisseur d'IPTV pour lequel vous souhaitez "
-            "enregistrer la {record_ranking} vidéo parmis celles qui peuvent être enregistrées "
-            "simultanément? (Le nom renseigné doit correspondre au fichier de configuration du "
-            "fournisseur se terminant par l'extension.ini et situé dans le dossier "
-            "~/.config/iptvselect-fr/iptv_providers). Par exemple, si votre fichier de configuration "
-            "est nommé moniptvquilestbon.ini, le nom de votre fournisseur à renseigner est moniptvquilestbon. "
-            "\n".format(record_ranking=record_ranking[provider_rank])
+            f"enregistrer la {record_ranking[provider_rank]} vidéo parmi "
+            "celles qui peuvent être enregistrées simultanément ? (Le nom "
+            "renseigné doit correspondre au fichier de configuration du "
+            "fournisseur se terminant par l'extension .ini et situé dans le dossier "
+            "~/.config/iptvselect-fr/iptv_providers). Par exemple, si votre "
+            "fichier de configuration est nommé moniptvquilestbon.ini, le nom "
+            "de votre fournisseur à renseigner est moniptvquilestbon. "
+            "\n"
         )
 
-        cmd = "cd ~/.config/iptvselect-fr && ls iptv_providers/{iptv_provider}.ini".format(
-            iptv_provider=shlex.quote(iptv_provider),
-        )
-        output = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-        )
-        stdout, stderr = output.communicate()
+        sanitized = sanitize_provider_name(iptv_provider)
+        if not sanitized:
+            logging.error("Nom de fournisseur invalide ou contenant des caractères interdits.")
+            print(
+                "Nom invalide : utilisez uniquement lettres, chiffres, '.', '_' et '-'. "
+                "Aucun séparateur de chemin ou '..' n'est autorisé."
+            )
+            continue
 
-        try:
-            stderr_text = stderr.decode("utf-8")
-        except UnicodeDecodeError:
-            stderr_text = stderr.decode("latin1")
+        provider_path = provider_path_from_name(sanitized)
 
-        try:
-            ls_result = stdout.decode("utf-8").rstrip()
-        except UnicodeDecodeError:
-            ls_result = stdout.decode("latin1").rstrip()
-
-        if stderr_text.strip() != "":
-            logging.error(f"Command '{cmd}' failed with error: {stderr_text}")
-
-
-        if ls_result != "iptv_providers/" + iptv_provider + ".ini":
+        if provider_path and provider_path.exists() and provider_path.is_file():
+            logging.info(f"Fichier trouvé : {provider_path}")
+            # Keep the original variable for use later
+            iptv_provider = sanitized
+            break
+        else:
+            logging.error(f"Fichier non trouvé ou chemin invalide : {provider_path}")
             print(
                 "Le fournisseur d'IPTV que vous avez renseigné ne correspond pas à un "
-                "fichier de configuration se terminant pas .ini dans le dossier "
+                "fichier de configuration se terminant par .ini dans le dossier "
                 "iptv_providers."
             )
+
             continue_config = "maybe"
             while continue_config.lower() not in answers:
                 continue_config = input(
-                    "Souhaitez-vous saisir de nouveau un fournisseur d'IPTV? "
+                    "Souhaitez-vous saisir de nouveau un fournisseur d'IPTV ? "
                     "(répondre par oui ou non). Si vous répondez non, le programme fermera "
-                    "pour vous laissez vérifier le nommage de vos fichiers de configuration).\n"
+                    "pour vous laisser vérifier le nommage de vos fichiers de configuration).\n"
                 )
             if continue_config.lower() == "non":
-                exit()
-        else:
-            break
+                sys.exit(0)
 
     while provider_recorder not in answers_apps:
         try:
             provider_recorder = int(
                 input(
                     "\nQuelle application souhaitez-vous utiliser pour "
-                    "enregistrer les vidéos de ce fournisseur d'IPTV? (vous pouvez utiliser "
-                    "le programme recorder_test.py pour tester la meilleur application). \n"
-                    "1) FFmpeg \n2) VLC\n3) Mplayer\n4) Streamlink\n"
-                    "Sélectionnez 1, 2, 3 ou 4\n"
+                    "enregistrer les vidéos de ce fournisseur d'IPTV ?\n"
+                    "(Vous pouvez utiliser le programme *recorder_test.py* "
+                    "pour tester l'application la plus adaptée.)\n\n"
+                    "1) FFmpeg\n2) VLC\n3) MPlayer\n4) Streamlink\n\n"
+                    "Veuillez sélectionner une option entre 1 et 4 : "
                 )
             )
         except ValueError:
@@ -134,38 +202,60 @@ while True:
             "enregistrements? (répondre par oui ou non) "
         )
 
+    ls_result = ""
+    backup_recorder_string = ""
+    backup_2_recorder_string = ""
+
     while True:
         if backup_answer.lower() == "oui":
             iptv_backup = input(
                 "\nQuel est le fournisseur d'IPTV pour lequel vous souhaitez "
-                "sauvegarder la {record_ranking} vidéo parmis celle qui peuvent être enregistrée "
-                "simultanément? (Le nom renseigné doit correspondre "
-                " au fichier de configuration du fournisseur se terminant par l'extension.ini "
-                "et situé dans le dossier iptv_providers). Par exemple, si votre fichier de configuration "
-                "est nommé moniptvquilestbon.ini, le nom de votre fournisseur à renseigner est moniptvquilestbon. "
-                "\n".format(record_ranking=record_ranking[provider_rank])
+                f"sauvegarder la {record_ranking[provider_rank]} vidéo parmis "
+                "celle qui peuvent être enregistrée simultanément? (Le nom "
+                "renseigné doit correspondre au fichier de configuration du "
+                "fournisseur se terminant par l'extension.ini et situé dans "
+                "le dossier iptv_providers). Par exemple, si votre fichier de "
+                "configuration est nommé moniptvquilestbon.ini, le nom de votre "
+                "fournisseur à renseigner est moniptvquilestbon.\n"
             )
             backup_2_ask = True
         else:
             iptv_backup = ""
-            backup_recorder_string = ""
             backup_2_ask = False
             break
 
-        cmd = "cd ~/.config/iptvselect-fr && ls iptv_providers/{iptv_backup}.ini".format(
-            iptv_backup=shlex.quote(iptv_backup)
-        )
-        output = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-        )
-        stdout, stderr = output.communicate()
-        ls_result = stdout.decode("utf-8")[:-1]
-        if stderr.decode("utf-8")[:-1] != "":
-            logging.error(
-                f"Command '{cmd}' failed with error: {stderr.decode('utf-8')}"
+        sanitized_bk = sanitize_provider_name(iptv_backup)
+        if not sanitized_bk:
+            logging.error("Nom de fournisseur de sauvegarde invalide.")
+            print(
+                "Nom invalide pour le fournisseur de sauvegarde : utilisez uniquement "
+                "lettres, chiffres, '.', '_' et '-'."
             )
+            # Ask user again or allow to exit
+            continue_config = "maybe"
+            while continue_config.lower() not in answers:
+                continue_config = input(
+                    "Souhaitez-vous saisir de nouveau un fournisseur d'IPTV? "
+                    "(répondre par oui ou non). Si vous répondez non, le programme "
+                    "fermera pour vous laissez vérifier le nommage de vos "
+                    "fichiers de configuration).\n"
+                )
+            if continue_config.lower() == "non":
+                sys.exit(0)
+            else:
+                continue
 
-        if ls_result != "iptv_providers/" + iptv_backup + ".ini":
+        provider_path = provider_path_from_name(sanitized_bk)
+
+        if provider_path and provider_path.exists():
+            ls_result = str(provider_path)
+            logging.info(f"Fichier trouvé : {provider_path}")
+        else:
+            logging.error(f"File not found: {provider_path}")
+            ls_result = ""
+
+        expected = str(PROVIDERS_DIR / f"{sanitized_bk}.ini")
+        if ls_result != expected:
             print(
                 "Le fournisseur d'IPTV que vous avez renseigné pour la sauvegarde "
                 "ne correspond pas à un fichier de configuration se terminant "
@@ -176,10 +266,11 @@ while True:
                 continue_config = input(
                     "Souhaitez-vous saisir de nouveau un fournisseur d'IPTV? "
                     "(répondre par oui ou non). Si vous répondez non, le programme "
-                    "fermera pour vous laissez vérifier le nommage de vos fichiers de configuration). \n"
+                    "fermera pour vous laissez vérifier le nommage de vos fichiers "
+                    "de configuration).\n"
                 )
             if continue_config.lower() == "non":
-                exit()
+                sys.exit(0)
             else:
                 continue
 
@@ -188,10 +279,11 @@ while True:
                 backup_recorder = int(
                     input(
                         "\nQuelle application souhaitez-vous utiliser pour "
-                        "enregistrer les vidéos de ce fournisseur d'IPTV? (vous pouvez utiliser "
-                        "le programme recorder_test.py pour tester la meilleur application). \n"
-                        "1) FFmpeg \n2) VLC\n3) Mplayer\n4) Streamlink\n"
-                        "Sélectionnez 1, 2, 3 ou 4\n"
+                        "enregistrer les vidéos de ce fournisseur d'IPTV ?\n"
+                        "(Vous pouvez utiliser le programme *recorder_test.py* "
+                        "pour tester l'application la plus adaptée.)\n\n"
+                        "1) FFmpeg\n2) VLC\n3) MPlayer\n4) Streamlink\n\n"
+                        "Veuillez sélectionner une option entre 1 et 4 : "
                     )
                 )
                 try:
@@ -218,32 +310,49 @@ while True:
         if backup_2_answer.lower() == "oui":
             iptv_backup_2 = input(
                 "\nQuel est le fournisseur d'IPTV pour lequel vous souhaitez "
-                "réaliser la deuxième sauvegarde de la {record_ranking} vidéo parmis celle qui "
-                "peuvent être enregistrée simultanément? (Le nom renseigné doit correspondre "
-                " au fichier de configuration du fournisseur se terminant par l'extension.ini "
-                "et situé dans le dossier iptv_providers). Par exemple, si votre fichier de configuration "
-                "est nommé moniptvquilestbon.ini, le nom de votre fournisseur à renseigner est moniptvquilestbon. "
-                "\n".format(record_ranking=record_ranking[provider_rank])
+                f"réaliser la deuxième sauvegarde de la {record_ranking[provider_rank]} "
+                "vidéo parmis celle qui peuvent être enregistrée simultanément? "
+                "(Le nom renseigné doit correspondre au fichier de configuration "
+                "du fournisseur se terminant par l'extension.ini et situé dans le "
+                "dossier iptv_providers). Par exemple, si votre fichier de configuration "
+                "est nommé moniptvquilestbon.ini, le nom de votre fournisseur à renseigner "
+                "est moniptvquilestbon.\n"
             )
         else:
             iptv_backup_2 = ""
             backup_2_recorder_string = ""
             break
 
-        cmd = "cd ~/.config/iptvselect-fr && ls iptv_providers/{iptv_backup_2}.ini".format(
-            iptv_backup_2=shlex.quote(iptv_backup_2)
-        )
-        output = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-        )
-        stdout, stderr = output.communicate()
-        ls_result = stdout.decode("utf-8")[:-1]
-        if stderr.decode("utf-8")[:-1] != "":
-            logging.error(
-                f"Command '{cmd}' failed with error: {stderr.decode('utf-8')}"
+        sanitized_bk2 = sanitize_provider_name(iptv_backup_2)
+        if not sanitized_bk2:
+            logging.error("Nom de fournisseur de 2ème sauvegarde invalide.")
+            print(
+                "Nom invalide pour le fournisseur de 2ème sauvegarde : utilisez uniquement "
+                "lettres, chiffres, '.', '_' et '-'."
             )
+            continue_config = "maybe"
+            while continue_config.lower() not in answers:
+                continue_config = input(
+                    "Souhaitez-vous saisir de nouveau un fournisseur d'IPTV? "
+                    "(répondre par oui ou non). Si vous répondez non, le programme fermera "
+                    "pour vous laissez vérifier le nommage de vos fichiers de configuration). \n"
+                )
+            if continue_config.lower() == "non":
+                sys.exit(0)
+            else:
+                continue
 
-        if ls_result != "iptv_providers/" + iptv_backup_2 + ".ini":
+        provider_path = provider_path_from_name(sanitized_bk2)
+
+        if provider_path and provider_path.exists():
+            ls_result = str(provider_path)
+            logging.info(f"Fichier trouvé : {provider_path}")
+        else:
+            ls_result = ""
+            logging.error(f"Fichier non trouvé : {provider_path}")
+
+        expected = str(PROVIDERS_DIR / f"{sanitized_bk2}.ini")
+        if ls_result != expected:
             print(
                 "Le fournisseur d'IPTV que vous avez renseigné pour la 2ème sauvegarde "
                 "ne correspond pas à un fichier de configuration se terminant "
@@ -257,21 +366,22 @@ while True:
                     "pour vous laissez vérifier le nommage de vos fichiers de configuration). \n"
                 )
             if continue_config.lower() == "non":
-                exit()
+                sys.exit(0)
             else:
                 continue
 
-        backup_recorder = 5
+        backup_recorder = 666
 
         while backup_recorder not in answers_apps:
             try:
                 backup_recorder = int(
                     input(
                         "\nQuelle application souhaitez-vous utiliser pour "
-                        "enregistrer les vidéos de ce fournisseur d'IPTV? (vous pouvez utiliser "
-                        "le programme recorder_test.py pour tester la meilleur application). \n"
-                        "1) FFmpeg \n2) VLC\n3) Mplayer\n4) Streamlink\n"
-                        "Sélectionnez 1, 2, 3 ou 4\n"
+                        "enregistrer les vidéos de ce fournisseur d'IPTV ?\n"
+                        "(Vous pouvez utiliser le programme *recorder_test.py* "
+                        "pour tester l'application la plus adaptée.)\n\n"
+                        "1) FFmpeg\n2) VLC\n3) MPlayer\n4) Streamlink\n\n"
+                        "Veuillez sélectionner une option entre 1 et 4 : "
                     )
                 )
                 try:
@@ -282,7 +392,7 @@ while True:
                 print("Vous devez sélectionner un chiffre entre 1 et 4")
         break
 
-    backup_recorder = 5
+    backup_recorder = 666
 
     provider_rank += 1
 
@@ -295,7 +405,7 @@ while True:
         "backup_2_recorder": backup_2_recorder_string,
     }
 
-    provider_recorder = 5
+    provider_recorder = 666
 
     if provider_rank < 4:
         answer = "maybe"
@@ -321,5 +431,12 @@ while True:
         print("Vous avez configuré le nombre maximal de fournisseur d'IPTV.")
         break
 
-with open("/home/" + user + "/.config/iptvselect-fr/iptv_select_conf.ini", "w") as conf:
-    config_object.write(conf)
+try:
+    with CONF_FILE.open("w", encoding="utf-8") as conf:
+        config_object.write(conf)
+    CONF_FILE.chmod(0o600)
+    logging.info(f"Fichier de configuration écrit : {CONF_FILE}")
+except Exception as e:
+    logging.error(f"Erreur lors de l'écriture du fichier de configuration : {e}")
+    print("Impossible d'écrire le fichier de configuration. Vérifiez les permissions.")
+    sys.exit(1)

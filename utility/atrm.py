@@ -16,19 +16,26 @@ answer = input("Voulez-vous annuler toutes les taches at? (répondre par oui ou 
 if answer.lower() != "oui":
     exit()
 else:
-    cmd = "atq | cut -f1"
-    atq = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
+    proc = subprocess.run(
+        ["atq"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,   # returns str instead of bytes
     )
-    stdout, stderr = atq.communicate()
-    pids = stdout.decode("utf-8").split("\n")[:-1]
+
+    pids = [line.split(None, 1)[0] for line in proc.stdout.splitlines() if line.strip()]
 
     for pid in pids:
         if args.pid_start is None or int(pid) > args.pid_start:
-            cmd = "atrm {pid}".format(pid=int(pid))
-            atrm = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
+            pid_int = int(pid)
+
+            result = subprocess.run(
+                ["atrm", str(pid_int)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
             )
-            atrm.wait()
 
     print("Toutes les tâches at ont été supprimées!")

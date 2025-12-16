@@ -1,18 +1,19 @@
+import re
 import subprocess
 
 """Script to remove specific at tasks"""
 
-cmd = "crontab -l | sed -n '/iptv-select/p' | cut -d '*' -f1"
-time_cron = subprocess.Popen(
-    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-)
-stdout, stderr = time_cron.communicate()
-time_curl = stdout.decode("utf-8")[:-2].split(" ")
+proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
+stdout = proc.stdout
+
+lines = [line for line in stdout.splitlines() if "iptvselect" in line]
+
+time_curl = [line.split("*", 1)[0].strip().split() for line in lines]
 
 print(
     "Votre box iptv est programmée pour rechercher les informations des vidéos que "
     "vous souhaitez enregistrer à {hour}H{minute}.".format(
-        hour=time_curl[1], minute=time_curl[0]
+        hour=time_curl[0][1], minute=time_curl[0][0]
     )
 )
 print(
@@ -31,10 +32,17 @@ print(
     "programmés'): \n"
 )
 
-cmd = "atq | cut -f1"
-atq = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-stdout, stderr = atq.communicate()
-pids = stdout.decode("utf-8").split("\n")[:-1]
+proc = subprocess.run(["atq"], capture_output=True, text=True)
+if proc.returncode != 0:
+    raise RuntimeError(f"atq failed: {proc.stderr.strip()}")
+
+pids = []
+for line in proc.stdout.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    first_field = line.split()[0]
+    pids.append(first_field)
 
 not_deleted = True
 to_skip = True
@@ -43,18 +51,35 @@ answer = "maybe"
 
 while not_deleted:
 
-    for pid in pids:
-        cmd = "at -c {pid} | sed -n '/fusion_script/p' | " "cut -d ' ' -f3".format(
-            pid=int(pid)
+    for pid_str in pids:
+        pid_str = pid_str.strip()
+        if not pid_str:
+            continue
+
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+
+        proc = subprocess.run(
+            ["at", "-c", str(pid)],
+            capture_output=True,
+            text=True,
         )
-        atprint = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-        )
-        stdout, stderr = atprint.communicate()
-        title = stdout.decode("utf-8")[:-1]
-        if title != "":
-            print(title)
-            to_skip = False
+
+        if proc.returncode != 0:
+            continue
+
+        for line in proc.stdout.splitlines():
+            if "fusion_script" not in line:
+                continue
+
+            parts = line.split()
+            title = parts[2] if len(parts) >= 3 else ""
+
+            if title:
+                print(title)
+                to_skip = False
 
     if to_skip:
         print(
@@ -67,21 +92,39 @@ while not_deleted:
         "(renseignez le numéro identifiant le film): "
     )
 
-    for pid in pids:
-        cmd = "at -c {pid} | sed -n '/{delete}/p' | " "cut -d ' ' -f3".format(
-            pid=int(pid), delete=delete
+    for pid_str in pids:
+        pid_str = pid_str.strip()
+        if not pid_str:
+            continue
+
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+
+        proc = subprocess.run(
+            ["at", "-c", str(pid)],
+            capture_output=True,
+            text=True,
         )
-        atprint = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-        )
-        stdout, stderr = atprint.communicate()
-        if stdout.decode("utf-8")[:-1] != "":
-            cmd = "atrm {pid}".format(pid=pid)
-            atrm = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-            )
-            atrm.wait()
+        if proc.returncode != 0:
+            continue
+
+        escaped_delete = re.escape(delete)
+
+        found = False
+        for line in proc.stdout.splitlines():
+            if re.search(escaped_delete, line):
+                parts = line.split()
+                title = parts[2] if len(parts) >= 3 else ""
+                if title:
+                    found = True
+                    break
+
+        if found:
+            rm_proc = subprocess.run(["atrm", str(pid)], capture_output=True, text=True)
             not_deleted = False
+
 
     if not_deleted:
         while answer.lower() not in answers:

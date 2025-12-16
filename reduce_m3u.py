@@ -1,67 +1,63 @@
-import subprocess
-import readline
 import os
+import re
+import stat
+from pathlib import Path
 
-m3u_file = "123456"
-ls_result = "abcdef"
+def human_readable(size_bytes):
+    """Convert bytes to a human-readable format similar to `du -h`."""
+    for unit in ["B", "K", "M", "G", "T"]:
+        if size_bytes < 1024.0:
+            # Remove decimal for bytes, keep one decimal for larger units
+            return f"{int(size_bytes)}{unit}" if unit == "B" else f"{size_bytes:.1f}{unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f}P"
 
-user = os.environ.get("USER")
+home_dir = Path.home()
 
-while (
-    ls_result
-    != "/home/" + user + "/.config/iptvselect-fr/iptv_providers/" + m3u_file + ".m3u"
-):
+# SECURITY: whitelist filenames to avoid path traversal
+valid_filename_re = re.compile(r"^[A-Za-z0-9._-]+$")
+
+while True:
     m3u_file = input(
         "Quel est le nom du fichier m3u de votre "
-        "fournisseur d'IPTV? (renseignez le nom "
-        "sans l'extension .m3u): "
-    )
-    cmd = (
-        "ls /home/"
-        + user
-        + "/.config/iptvselect-fr/iptv_providers/{m3u_file}.m3u".format(m3u_file=m3u_file)
-    )
-    output = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-    )
-    stdout, stderr = output.communicate()
-    ls_result = stdout.decode("utf-8")[:-1]
-    if (
-        ls_result
-        != "/home/" + user + "/.config/iptvselect-fr/iptv_providers/" + m3u_file + ".m3u"
-    ):
+        "fournisseur d'IPTV? (renseignez le nom sans "
+        "l'extension .m3u): "
+    ).strip()
+
+    if not valid_filename_re.match(m3u_file):
+        print("Nom de fichier invalide. Caractères autorisés: lettres, chiffres, ., _, -\n")
+        continue
+
+    m3u_path = home_dir / ".config/iptvselect-fr/iptv_providers" / f"{m3u_file}.m3u"
+
+    # SECURITY: prevent symlink attacks
+    if m3u_path.exists() and m3u_path.is_symlink():
+        print("Erreur: le fichier est un lien symbolique. Refus pour raisons de sécurité.\n")
+        continue
+
+    if not m3u_path.exists():
         print(
-            "Le fichier {m3u_file}.m3u n'est pas présent dans votre"
-            " dossier ~/.config/iptvselect-fr/iptv_providers. Insérer "
-            "le fichier m3u de votre fournisseur d'IPTV ou modifier "
-            "le nom du fichier m3u pour qu'il corresponde à celui "
-            "du fichier présent dans le dossier.\n".format(m3u_file=m3u_file)
+            f"Le fichier {m3u_file}.m3u n'est pas présent dans votre dossier "
+            "~/.config/iptvselect-fr/iptv_providers. "
+            "Insérez le fichier m3u de votre fournisseur d'IPTV "
+            "ou modifiez le nom du fichier pour qu'il corresponde.\n"
         )
+        continue
+    break
 
-cmd = (
-    "du -h /home/" + user + "/.config/iptvselect-fr/iptv_"
-    "providers/{m3u_file}.m3u | cut -f1"
-).format(m3u_file=m3u_file)
-duh = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-stdout, stderr = duh.communicate()
-file_size = stdout.decode("utf-8")[:-1]
-
-print(
-    "\nLa taille du fichier {m3u_file}.m3u est de {file_size}".format(
-        m3u_file=m3u_file, file_size=file_size
-    )
-)
+file_size = human_readable(m3u_path.stat().st_size)
+print(f"\nLa taille du fichier {m3u_file}.m3u est de {file_size}")
 
 answers = ["oui", "non"]
 answer = "maybe"
 
 while answer.lower() not in answers:
     answer = input(
-        "\nVoulez-vous réduire la taille du fichier {m3u_file}.m3u "
+        f"\nVoulez-vous réduire la taille du fichier {m3u_file}.m3u "
         "afin d'exécuter plus rapidement le script fill_ini.py? "
         "(répondre par oui ou non). \n"
         "Le programme va enlever tous les liens m3u du fichier "
-        "{m3u_file}.m3u qui contiennent des extensions vidéos "
+        f"{m3u_file}.m3u qui contiennent des extensions vidéos "
         "tels que .avi, .mkv et .mp4. Veuillez sauvegarder "
         "votre fichier .m3u si vous voulez conserver l'original "
         "car le script ne créé pas de sauvegarde du "
@@ -70,46 +66,34 @@ while answer.lower() not in answers:
         "taille et de la quantité de mémoire vive présente. (merci d'attendre "
         "le retour à l'invite de commande après l'annonce de la nouvelle taille "
         "du fichier car à cause de l'utilisation du SWAP, cela peut durer plusieurs "
-        "minutes pour les boxs de moins de 1Gb de mémoire vive.)\n".format(
-            m3u_file=m3u_file
-        )
+        "minutes pour les boxs de moins de 1Gb de mémoire vive.)\n"
     )
 
 extensions = [".avi", ".mkv", ".mp4"]
 
 if answer.lower() == "oui":
-    with open(
-        "/home/" + user + "/.config/iptvselect-fr/iptv_providers/" + m3u_file + ".m3u", "r"
-    ) as m3u:
-        m3u_lines = [line for line in m3u]
+    with open(m3u_path, "r", encoding="utf-8") as m3u:
+        m3u_lines = m3u.readlines()
         lines = []
 
-        for n in range(len(m3u_lines)):
-            if m3u_lines[n][0] == "#":
-                if m3u_lines[n + 1][-5:-1] not in extensions:
-                    lines.append(m3u_lines[n])
+        for i, line in enumerate(m3u_lines):
+            next_line = m3u_lines[i + 1] if i + 1 < len(m3u_lines) else None
+
+            if line.startswith("#"):
+                if next_line and next_line[-5:-1] not in extensions:
+                    lines.append(line)
             else:
-                if m3u_lines[n][-5:-1] not in extensions:
-                    lines.append(m3u_lines[n])
+                if line[-5:-1] not in extensions:
+                    lines.append(line)
 else:
     exit()
 
-with open(
-    "/home/" + user + "/.config/iptvselect-fr/iptv_providers/" + m3u_file + ".m3u", "w"
-) as m3u:
+with open(m3u_path, "w", encoding="utf-8") as m3u:
     for line in lines:
         m3u.write(line)
 
-cmd = (
-    "du -h /home/" + user + "/.config/iptvselect-fr/iptv_"
-    "providers/{m3u_file}.m3u | cut -f1"
-).format(m3u_file=m3u_file)
-duh = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-stdout, stderr = duh.communicate()
-file_size = stdout.decode("utf-8")[:-1]
+# SECURITY: enforce strict file permissions
+os.chmod(m3u_path, stat.S_IRUSR | stat.S_IWUSR)  # 600
 
-print(
-    "\nLa taille du fichier {m3u_file}.m3u est maintenant de {file_size}".format(
-        m3u_file=m3u_file, file_size=file_size
-    )
-)
+file_size = human_readable(m3u_path.stat().st_size)
+print(f"\nLa taille du fichier {m3u_file}.m3u est maintenant de {file_size}")

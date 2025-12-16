@@ -1,34 +1,34 @@
+import os
+import signal
 import subprocess
 import time
-import shlex
-import os
+import re
+import getpass
 
 from configparser import ConfigParser
+from pathlib import Path
 
-user = os.environ.get("USER")
+user = getpass.getuser()
 
-config_iptv_select = ConfigParser()
-config_iptv_select.read("/home/" + user + "/.config/iptvselect-fr/iptv_select_conf.ini")
+config_iptv_select = ConfigParser(interpolation=None)
+config_iptv_select.read(f"/home/{user}/.config/iptvselect-fr/iptv_select_conf.ini")
 
+home_dir = os.path.expanduser("~")
+target_dir = os.path.join(home_dir, "videos_select")
 
-cmd = "ls ~ | grep ^videos_select$"
-output = subprocess.Popen(
-    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-)
-stdout, stderr = output.communicate()
-ls_directory = stdout.decode("utf-8")[:-1]
-
-if ls_directory == "":
-    cmd = "mkdir ~/videos_select"
-    directory = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-    )
-    directory.wait()
-    print("Le dossier videos_select a été créé dans votre dossier home.\n")
+if not os.path.isdir(target_dir):
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        print("Le dossier videos_select a été créé dans votre dossier home.\n")
+    except Exception:
+        print("Impossible de créer le dossier videos_select.")
+        exit()
+else:
+    print("Le dossier videos_select existe déjà.\n")
 
 recorders = ["ffmpeg", "vlc", "mplayer", "streamlink"]
 answers = [1, 2, 3, 4]
-recorder = 5
+recorder = 666
 
 while recorder not in answers:
     try:
@@ -50,10 +50,13 @@ iptv_provider = input(
     "est nommé moniptvquilestbon.ini, le nom de votre fournisseur à renseigner est moniptvquilestbon,  \n"
 )
 
+if not re.fullmatch(r"[A-Za-z0-9_\-]+", iptv_provider):
+    print("Nom de fournisseur IPTV invalide.")
+    exit()
 
-config_iptv_provider = ConfigParser()
+config_iptv_provider = ConfigParser(interpolation=None)
 config_iptv_provider.read(
-    "/home/" + user + "/.config/iptvselect-fr/iptv_providers/" + iptv_provider + ".ini"
+    f"/home/{user}/.config/iptvselect-fr/iptv_providers/{iptv_provider}.ini"
 )
 
 m3u8_link = ""
@@ -64,6 +67,13 @@ while m3u8_link == "":
         "laquelle vous souhaitez tester l'application? (la chaîne renseignée doit "
         "correspondre exactement à la chaîne renseignée dans le fichier de configuration.)\n"
     )
+
+    if "\x00" in channel:  # NULL byte attack prevention
+        print("Nom de chaîne invalide (caractère interdit détecté).")
+        exit()
+
+    channel = channel.strip()
+
     try:
         m3u8_link = config_iptv_provider["CHANNELS"][channel]
     except KeyError:
@@ -78,11 +88,20 @@ while m3u8_link == "":
             "recorder_test.py.\n"
         )
         exit()
-    if m3u8_link == "":
-        print(
-            "La chaine que vous avez renseignée ne comporte pas de lien m3u pour tester un "
-            "enregistrement. Veuillez choisir une autre chaîne."
-        )
+
+    if not m3u8_link.startswith(("http://", "https://", "rtsp://")):
+        print("Le lien m3u8/rtsp du fichier .ini semble invalide.")
+        exit()
+
+    if len(m3u8_link) > 2000:
+        print("URL IPTV trop longue, potentiellement dangereuse.")
+        exit()
+
+if m3u8_link == "":
+    print(
+        "La chaine que vous avez renseignée ne comporte pas de lien m3u pour tester un "
+        "enregistrement. Veuillez choisir une autre chaîne."
+    )
 
 try:
     duration = int(
@@ -97,73 +116,90 @@ except ValueError:
 
 title = input("\nQuel titre souhaitez-vous donner à votre vidéo de test?\n")
 
+safe_title = re.sub(r"[^A-Za-z0-9._-]", "_", title)
+
+home = Path.home()
+videos_dir = home / "videos_select"
+logs_dir = home / ".local/share/iptvselect-fr/logs"
+
+videos_dir.mkdir(exist_ok=True, parents=True)
+logs_dir.mkdir(exist_ok=True, parents=True)
+
+output_path = videos_dir / f"{safe_title}_{recorders[recorder-1]}.ts"
+log_path = logs_dir / f"infos_{recorders[recorder-1]}.log"
+
 if recorder == 1:
-    cmd = (
-        "ffmpeg -y -i {m3u8_link} -map 0:v -map 0:a -map 0:s? -c:v copy "
-        "-c:a copy -c:s copy -t {duration} "
-        "-f mpegts -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 1"
-        " -reconnect_at_eof -y /home/$USER/videos_select/"
-        "{title}_ffmpeg.ts >> ~/.local/share/iptvselect-fr/logs/infos_ffmpeg.ts "
-        "2>&1".format(m3u8_link=shlex.quote(m3u8_link), duration=duration, title=title)
-    )
+    cmd = [
+        "ffmpeg", "-y", "-i", m3u8_link,
+        "-map", "0:v", "-map", "0:a", "-map", "0:s?",
+        "-c:v", "copy", "-c:a", "copy", "-c:s", "copy",
+        "-t", str(duration),
+        "-f", "mpegts",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "1",
+        "-reconnect_at_eof", "-y",
+        str(output_path)
+    ]
+
 elif recorder == 2:
-    cmd = (
-        "vlc -vvv {m3u8_link} --run-time {duration} --sout=file/ts"
-        ":/home/$USER/videos_select/{title}_vlc.ts "
-        ">> ~/.local/share/iptvselect-fr/logs/infos_vlc.log 2>&1".format(
-            m3u8_link=shlex.quote(m3u8_link), duration=duration, title=title
-        )
-    )
+    cmd = [
+        "vlc", "-vvv", m3u8_link,
+        "--run-time", str(duration),
+        f"--sout=file/ts:{output_path}"
+    ]
+
 elif recorder == 3:
-    cmd = (
-        "mplayer {m3u8_link} -dumpstream -dumpfile "
-        "/home/$USER/videos_select/{title}_mplayer.ts >> "
-        "~/.local/share/iptvselect-fr/logs/infos_mplayer.log 2>&1".format(
-            m3u8_link=shlex.quote(m3u8_link), title=title
-        )
-    )
+    cmd = [
+        "mplayer", m3u8_link,
+        "-dumpstream",
+        "-dumpfile", str(output_path)
+    ]
+
 else:
-    cmd = (
-        "streamlink --http-no-ssl-verify --hls-live-restart --stream-timeout 600 "
-        "--hls-segment-threads 10 --hls-segment-timeout 10 --stream-segment-attempts 100 "
-        "--retry-streams 1 --retry-max 100 --hls-duration 00:{duration} "
-        "-o /home/$USER/videos_select/{title}_streamlink.ts {m3u8_link} best "
-        ">> ~/.local/share/iptvselect-fr/logs/infos_streamlink.log 2>&1".format(
-            m3u8_link=shlex.quote(m3u8_link), title=title, duration=duration
-        )
-    )
+    cmd = [
+        str(home / ".local/share/iptvselect-fr/.venv/bin/streamlink"),
+        "--ffmpeg-validation-timeout", "15.0",
+        "--http-no-ssl-verify",
+        # "--hls-live-restart",
+        "--stream-segment-attempts", "100",
+        "--retry-streams", "1",
+        "--retry-max", "100",
+        "--stream-segmented-duration", str(duration),
+        "-o", str(output_path),
+        m3u8_link,
+        "best"
+    ]
 
 print("\nLa commande lancée est:\n")
-print(cmd)
+print(" ".join(cmd))
+
 print(
     "\nVous pourrez retrouver le fichier vidéo dans le dossier videos_select "
-    "qui est lui même situé dans votre dossier home\n"
+    "qui est lui-même situé dans votre dossier home\n"
 )
 print(
-    "Si la vidéo n'est pas présente dans le dossier videos_select, c'est que "
-    "celui-ci est en échec avec {application} pour ce fournisseur d'IPTV. Les "
-    "logs pour débugger l'échec de l'enregistrement se trouvent dans le fichier "
-    "~/.local/share/iptvselect-fr/logs/infos_{application}.log".format(
-        application=recorders[recorder - 1]
-    )
+    f"Les logs se trouvent dans {log_path}\n"
 )
 
-test_record = subprocess.Popen(
-    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-)
+with open(log_path, "w") as log_file:
+    test_record = subprocess.Popen(
+        cmd, stdout=log_file, stderr=subprocess.STDOUT
+    )
+
+try:
+    test_record.wait(timeout=duration + 30)
+except subprocess.TimeoutExpired:
+    print("Processus trop long, arrêt forcé.")
+    try:
+        test_record.kill()
+    except Exception:
+        pass
 
 if 2 <= recorder <= 3:
-    time.sleep(duration)
-    cmd = "ps -ef | grep {title} | tr -s ' ' " "| cut -d ' ' -f2 | head -n 2".format(
-        title=title
-    )
-    pid_range = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-    )
-    stdout, stderr = pid_range.communicate()
-    pid = stdout.decode("utf-8").split("\n")[:-1][1]
-    cmd = "kill {pid}".format(pid=pid)
-    kill = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
-    )
-    quit()
+    try:
+        os.kill(test_record.pid, signal.SIGTERM)
+    except Exception:
+        pass
+
+quit()

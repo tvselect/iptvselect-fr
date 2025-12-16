@@ -8,6 +8,9 @@ import requests
 import tempfile
 import subprocess
 import shutil
+import stat
+import pathlib
+import errno
 
 from requests.exceptions import ConnectTimeout, ConnectionError, RequestException
 from time import sleep
@@ -21,12 +24,22 @@ def create_dir_with_permissions(path, mode):
         path (str): The directory path to create or check.
         mode (int): The permission mode to set (e.g., 0o740).
     """
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-        os.chmod(path, mode)
-        print(f"Directory created: {path}")
-    else:
-        print(f"Directory already exists: {path}")
+    path_obj = pathlib.Path(path).expanduser()
+    try:
+        if not path_obj.exists():
+            # umask may interfere; set permissions explicitly after creation
+            path_obj.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(path_obj), mode)
+            print(f"Directory created: {path}")
+        else:
+            # ensure permissions are at least as strict as requested
+            current = stat.S_IMODE(os.stat(str(path_obj)).st_mode)
+            if current != mode:
+                os.chmod(str(path_obj), mode)
+            print(f"Directory already exists: {path}")
+    except OSError as e:
+        print(f"Failed to create or set permissions on {path}: {e}")
+        raise
 
 def get_gpg_keys():
     """Lists GPG keys with cryptographic method and key strength."""
@@ -42,9 +55,13 @@ def get_gpg_keys():
     for line in output.splitlines():
         parts = line.split(":")
         if parts[0] == "pub":  # Public key entry
-            key_type = parts[3]  # Algorithm type (1=RSA, 16=ElGamal, 17=DSA, 18=ECDSA, 19=Ed25519, 22=Curve25519)
-            key_size = int(parts[2])  # Key length in bits
-            key_id = parts[4][-8:]  # Last 8 digits of the key fingerprint
+            # guard against malformed output
+            try:
+                key_size = int(parts[2])
+                key_type = parts[3]
+                key_id = parts[4][-8:]
+            except (IndexError, ValueError):
+                continue
 
             # Determine key type and strength
             if key_type == "1":
@@ -52,19 +69,19 @@ def get_gpg_keys():
                 secure = key_size >= 4096
             elif key_type == "16":
                 algo = "ElGamal"
-                secure = False  # Not recommended for password storage
+                secure = False
             elif key_type == "17":
                 algo = "DSA"
-                secure = False  # Deprecated
+                secure = False
             elif key_type == "18":
                 algo = "ECDSA"
-                secure = key_size >= 256  # At least 256 bits
+                secure = key_size >= 256
             elif key_type == "19":
                 algo = "Ed25519"
-                secure = True  # Secure by design
+                secure = True
             elif key_type == "22":
                 algo = "Curve25519"
-                secure = True  # Secure by design
+                secure = True
             else:
                 algo = f"Unknown ({key_type})"
                 secure = False
@@ -74,41 +91,28 @@ def get_gpg_keys():
 
     return keys
 
-
 home_dir = os.path.expanduser("~")
-output = subprocess.Popen(
-    ["ls", home_dir], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-)
-stdout, stderr = output.communicate()
 
-ls_directory = ""
-for line in stdout.decode("utf-8").splitlines():
-    if line == "videos_select":
-        ls_directory = line
-        break
-
-if ls_directory == "":
-    directory_path = os.path.expanduser("~/videos_select")
-    cmd = ["mkdir", directory_path]
-    directory = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    directory.wait()
-    print("Le dossier videos_select a été créé dans votre dossier home.\n")
+videos_select_path = os.path.join(home_dir, "videos_select")
+try:
+    if not os.path.isdir(videos_select_path):
+        os.makedirs(videos_select_path, exist_ok=True)
+        os.chmod(videos_select_path, 0o700)
+        print("Le dossier videos_select a été créé dans votre dossier home.\n")
+except OSError as e:
+    print(f"Erreur lors de la création de {videos_select_path}: {e}")
+    raise
 
 permission_mode = 0o700
 
+# create required directories with explicit permissions
 create_dir_with_permissions(os.path.expanduser("~/.local"), permission_mode)
 create_dir_with_permissions(os.path.expanduser("~/.local/share"), permission_mode)
-create_dir_with_permissions(
-    os.path.expanduser("~/.local/share/iptvselect-fr"), permission_mode
-)
-create_dir_with_permissions(
-    os.path.expanduser("~/.local/share/iptvselect-fr/logs"), permission_mode
-)
+create_dir_with_permissions(os.path.expanduser("~/.local/share/iptvselect-fr"), permission_mode)
+create_dir_with_permissions(os.path.expanduser("~/.local/share/iptvselect-fr/logs"), permission_mode)
 create_dir_with_permissions(os.path.expanduser("~/.config"), permission_mode)
 create_dir_with_permissions(os.path.expanduser("~/.config/iptvselect-fr"), permission_mode)
-create_dir_with_permissions(
-    os.path.expanduser("~/.config/iptvselect-fr/iptv_providers"), permission_mode
-)
+create_dir_with_permissions(os.path.expanduser("~/.config/iptvselect-fr/iptv_providers"), permission_mode)
 
 
 print(
@@ -120,20 +124,36 @@ src = os.path.expanduser("~/iptvselect-fr/constants.ini")
 dest_dir = os.path.expanduser("~/.config/iptvselect-fr")
 dest = os.path.join(dest_dir, "constants.ini")
 
-if not os.path.isfile(dest):
-    shutil.copy(src, dest)
-    print(f"Le fichier {src} a été copié vers {dest}.\n")
-else:
-    print(f"Le fichier constants.ini existe déjà dans {dest}.\n")
+try:
+    if not os.path.isfile(dest):
+        if os.path.isfile(src):
+            shutil.copy2(src, dest)
+            os.chmod(dest, 0o640)
+            print(f"Le fichier {src} a été copié vers {dest}.\n")
+        else:
+            print(f"Fichier source manquant : {src} — impossible de copier constants.ini.")
+    else:
+        print(f"Le fichier constants.ini existe déjà dans {dest}.\n")
+except (OSError, shutil.Error) as e:
+    print(f"Erreur lors de la copie de constants.ini : {e}")
 
+# copy provider files but guard against missing pattern
 src_path = os.path.expanduser("~/iptvselect-fr/iptv_providers/freeboxtv*")
 dest_dir = os.path.expanduser("~/.config/iptvselect-fr/iptv_providers")
+files_copied = 0
 for file in glob.glob(src_path):
-    shutil.copy(file, dest_dir)
-print(
-    "Les fichiers freeboxtv pour les abonnés Free ont été copiés "
-    "dans le dossier ~/.config/iptvselect-fr/iptv_providers .\n"
-)
+    try:
+        shutil.copy2(file, dest_dir)
+        files_copied += 1
+    except (OSError, shutil.Error) as e:
+        print(f"Failed to copy {file} -> {dest_dir}: {e}")
+if files_copied:
+    print(
+        "Les fichiers freeboxtv pour les abonnés Free ont été copiés "
+        "dans le dossier ~/.config/iptvselect-fr/iptv_providers .\n"
+    )
+else:
+    print("Aucun fichier freeboxtv trouvé à copier.\n")
 
 print("Configuration des tâches cron du programme IPTV-select:\n")
 
@@ -141,12 +161,16 @@ timeout = 6
 
 try:
     response = requests.head("https://iptv-select.fr", timeout=timeout)
+    response.raise_for_status()
 except ConnectTimeout:
     print(f"Connection to IPTV-select.fr timed out after {timeout} seconds")
+    exit(1)
 except ConnectionError:
-    print(f"Failed to connect to IPTV-select.fr")
+    print("Failed to connect to IPTV-select.fr")
+    exit(1)
 except RequestException as e:
     print(f"Request failed: {e}")
+    exit(1)
 
 http_response = response.status_code
 
@@ -156,30 +180,49 @@ if http_response != 200:
         "vérifier votre connection internet et relancer le programme "
         "d'installation.\n\n"
     )
-    exit()
+    exit(1)
 
-user = os.environ.get("USER")
+user = os.environ.get("USER") or getpass.getuser()
+
+user = str(user).strip()
+if "\n" in user or "\r" in user or user == "":
+    raise SystemExit("Invalid USER environment variable detected; aborting for safety.")
 
 answers = ["oui", "non"]
 
 crypted = "no_se"
 
 while crypted.lower() not in answers:
-    crypted = input("\nVoulez vous chiffrer les identifiants de connection à "
-                    "l'application web IPTV-select.fr? Si vous répondez oui, "
-                    "il faudra penser à débloquer gnome-keyring (ou tout "
-                    "autre backend disponible sur votre système) à chaque "
-                    "nouvelle session afin de permettre l'accès aux "
-                    "identifiants par l'application IPTV-select-fr. "
-                    "(répondre par oui ou non) : ").strip().lower()
+    crypted = input(
+        "\nVoulez vous chiffrer les identifiants de connection à "
+        "l'application web IPTV-select.fr? Si vous répondez oui, "
+        "il faudra penser à débloquer gnome-keyring (ou tout "
+        "autre backend disponible sur votre système) à chaque "
+        "nouvelle session afin de permettre l'accès aux "
+        "identifiants par l'application IPTV-select-fr. "
+        "(répondre par oui ou non) : "
+    ).strip().lower()
 
 config_path = os.path.join("/home", user, ".config/iptvselect-fr/config.py")
 template_path = os.path.join("/home", user, "iptvselect-fr/config_template.py")
 
-if not os.path.exists(config_path):
-    shutil.copy(template_path, config_path)
-    os.chmod(config_path, 0o640)
+# create config by copying template atomically and set secure mode
+try:
+    if not os.path.exists(config_path):
+        if os.path.isfile(template_path):
+            # write to temp file then atomically replace
+            with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(config_path)) as tf:
+                tf_name = tf.name
+                with open(template_path, "r") as tpl:
+                    tf.write(tpl.read())
+            os.replace(tf_name, config_path)
+            os.chmod(config_path, 0o640)
+        else:
+            print(f"Template missing: {template_path}; cannot create config.")
+except OSError as e:
+    print(f"Error creating config at {config_path}: {e}")
 
+# generate random times
 heure = random.randint(6, 23)
 minute = random.randint(0, 58)
 minute_2 = minute + 1
@@ -188,17 +231,27 @@ minute_auto_update = random.randint(0, 59)
 
 params = ["CRYPTED_CREDENTIALS", "CURL_HOUR", "CURL_MINUTE"]
 
-with open("/home/" + user + "/.config/iptvselect-fr/config.py", "w") as conf:
-    for param in params:
-        if "CRYPTED_CREDENTIALS" in param:
-            if crypted.lower() == "oui":
-                conf.write("CRYPTED_CREDENTIALS = True\n")
-            else:
-                conf.write("CRYPTED_CREDENTIALS = False\n")
-        elif "CURL_HOUR" in param:
-            conf.write(f"{param} = {heure}\n")
-        elif "CURL_MINUTE" in param:
-            conf.write(f"{param} = {minute}\n")
+# Write config values securely using atomic write
+conf_lines = []
+for param in params:
+    if "CRYPTED_CREDENTIALS" in param:
+        conf_lines.append(f"CRYPTED_CREDENTIALS = {crypted.lower() == 'oui'}\n")
+    elif "CURL_HOUR" in param:
+        conf_lines.append(f"{param} = {heure}\n")
+    elif "CURL_MINUTE" in param:
+        conf_lines.append(f"{param} = {minute}\n")
+
+try:
+    conf_dir = os.path.dirname(config_path)
+    os.makedirs(conf_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=conf_dir) as tf:
+        tf.write("".join(conf_lines))
+        tmpname = tf.name
+    # set secure permissions and replace atomically
+    os.chmod(tmpname, 0o600)
+    os.replace(tmpname, config_path)
+except OSError as e:
+    print(f"Failed to write config values to {config_path}: {e}")
 
 hdmi_screen = "no_se"
 
@@ -207,13 +260,16 @@ if crypted.lower() == "oui":
     display_available = os.environ.get("DISPLAY")
     if ssh_connection is not None or not display_available:
         while hdmi_screen.lower() not in answers:
-            hdmi_screen = input("\nVous êtes connecté en SSH à votre machine ou votre système pourrait ne "
+            hdmi_screen = input(
+                "\nVous êtes connecté en SSH à votre machine ou votre système pourrait ne "
                 "pas avoir d'interface graphique. Avez-vous accès à une interface graphique? "
                 "Répondez 'oui' si vous pouvez connecter un écran et visualiser les applications, "
                 "ou 'non' si vous ne pouvez vous connecter que via SSH ou si aucune interface graphique n'est disponible"
-                "(exemple: VM, carte Nanopi-NEO, server, OS sans interface graphique): ").strip().lower()
+                "(exemple: VM, carte Nanopi-NEO, server, OS sans interface graphique): "
+            ).strip().lower()
     else:
         hdmi_screen = "oui"
+
     if hdmi_screen == "non":
         gpg_keys = get_gpg_keys()
         if not gpg_keys:
@@ -224,7 +280,7 @@ if crypted.lower() == "oui":
                 "\n\ngpg --full-generate-key\nVous pouvez suivre le tutoriel suivant pour ajouter "
                 "la clé GPG sécurisé: https://iptv-select.fr/advice-gpg puis relancez le programme d'installation."
             )
-            exit()
+            exit(1)
         else:
             print("Voici la liste de vos clés GPG qui sont assez sécurisées pour chiffrer vos identifiants de connexion:")
             for index, (key_id, algo, key_size) in enumerate(gpg_keys, start=1):
@@ -239,74 +295,135 @@ if crypted.lower() == "oui":
                         print("Veuillez entrer un nombre valide.")
             else:
                 selected_key = 1
-            process = subprocess.run(["pass", "init", gpg_keys[selected_key - 1][0]],
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+            # initialize pass with the chosen key, check returncode
+            try:
+                proc = subprocess.run(
+                    ["pass", "init", gpg_keys[selected_key - 1][0]],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if proc.returncode != 0:
+                    print(f"pass init failed: {proc.stderr.strip()}")
+            except FileNotFoundError:
+                print("Le gestionnaire 'pass' n'est pas installé ou non trouvé dans PATH.")
+                exit(1)
 
 http_status = 403
 
 if hdmi_screen == "non":
     sleep(1)
-    print("Veuillez saisir l'email de votre compte à IPTV-select.fr. L'email "
-          "ne sera pas visible par mesure de sécurité et devra être répété "
-          "une 2ème fois pour s'assurer d'avoir saisi l'email correctement. S'"
-          "il vous est posé la question 'An entry already exists for "
-          "iptv-select/email. Overwrite it? [y/N] y', répondez y")
-    insert_email = subprocess.run(["pass", "insert", "iptv-select/email"])
+    print(
+        "Veuillez saisir l'email de votre compte à IPTV-select.fr. L'email "
+        "ne sera pas visible par mesure de sécurité et devra être répété "
+        "une 2ème fois pour s'assurer d'avoir saisi l'email correctement. S'"
+        "il vous est posé la question 'An entry already exists for "
+        "iptv-select/email. Overwrite it? [y/N] y', répondez y"
+    )
+    try:
+        insert_email = subprocess.run(["pass", "insert", "iptv-select/email"], check=False)
+    except FileNotFoundError:
+        print("Le gestionnaire 'pass' n'est pas installé ou non trouvé dans PATH.")
+        exit(1)
+
     sleep(1)
-    print("Veuillez saisir le mot de passe de votre compte à IPTV-select.fr. "
-          "Le mot de passe ne sera pas visible par mesure de sécurité et "
-          "devra être répété une 2ème fois pour s'assurer d'avoir saisi "
-          "l'email correctement. S'il vous est posé la question 'An entry already exists for "
-          "iptv-select/password. Overwrite it? [y/N] y', répondez y")
-    insert_password = subprocess.run(["pass", "insert", "iptv-select/password"])
+    print(
+        "Veuillez saisir le mot de passe de votre compte à IPTV-select.fr. "
+        "Le mot de passe ne sera pas visible par mesure de sécurité et "
+        "devra être répété une 2ème fois pour s'assurer d'avoir saisi "
+        "l'email correctement. S'il vous est posé la question 'An entry already exists for "
+        "iptv-select/password. Overwrite it? [y/N] y', répondez y"
+    )
+    try:
+        insert_password = subprocess.run(["pass", "insert", "iptv-select/password"], check=False)
+    except FileNotFoundError:
+        print("Le gestionnaire 'pass' n'est pas installé ou non trouvé dans PATH.")
+        exit(1)
 else:
     username_iptvselect = input(
         "Veuillez saisir votre identifiant de connexion (adresse "
         "email) sur IPTV-select.fr: "
-    )
+    ).strip()
     password_iptvselect = getpass.getpass(
         "Veuillez saisir votre mot de passe sur IPTV-select.fr: "
     )
 
+# helper to safely read from 'pass' and return decoded text stripped
+def run_pass_get(entry):
+    try:
+        p = subprocess.run(["pass", entry], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        print("Le gestionnaire 'pass' n'est pas installé ou non trouvé dans PATH.")
+        raise
+    if p.returncode != 0:
+        # it's possible pass returns non-zero when entry not found
+        raise RuntimeError(f"'pass {entry}' failed: {p.stderr.strip()}")
+    # pass prints a trailing newline; strip it, also protect against control chars
+    value = p.stdout.strip()
+    if "\n" in value or "\r" in value:
+        # multi-line values are suspicious for credentials in this context
+        raise ValueError("Unexpected multiline value returned from pass; aborting.")
+    return value
 
 while http_status != 200:
 
     if hdmi_screen == "non":
-        pass_email = subprocess.run(["pass", "iptv-select/email"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        username_iptvselect = pass_email.stdout.strip()
-        pass_password = subprocess.run(["pass", "iptv-select/password"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        password_iptvselect = pass_password.stdout.strip()
+        try:
+            username_iptvselect = run_pass_get("iptv-select/email")
+            password_iptvselect = run_pass_get("iptv-select/password")
+        except Exception as e:
+            print(f"Failed to retrieve credentials from pass: {e}")
+            try_again = input("Voulez-vous réessayer d'entrer les identifiants manuellement? (oui/non): ").strip().lower()
+            if try_again != "oui":
+                exit(1)
+            else:
+                username_iptvselect = input("Veuillez saisir de nouveau votre identifiant (email): ").strip()
+                password_iptvselect = getpass.getpass("Veuillez saisir de nouveau votre mot de passe: ")
 
     timeout = 4
 
     try:
-        response = requests.head("https://www.iptv-select.fr/api/v1/prog", auth=(username_iptvselect, password_iptvselect), timeout=timeout)
+        response = requests.head(
+            "https://www.iptv-select.fr/api/v1/prog",
+            auth=(username_iptvselect, password_iptvselect),
+            timeout=timeout,
+        )
+        response.raise_for_status()
     except ConnectTimeout:
         print(f"Connection to IPTV-select.fr timed out after {timeout} seconds")
+        http_status = 0
+        continue
     except ConnectionError:
-        print(f"Failed to connect to IPTV-select.fr")
+        print("Failed to connect to IPTV-select.fr")
+        http_status = 0
+        continue
     except RequestException as e:
-        print(f"Request failed: {e}")
-
-    http_status = response.status_code
+        if hasattr(e, "response") and e.response is not None:
+            http_status = e.response.status_code
+        else:
+            print(f"Request failed: {e}")
+            http_status = 0
+        pass
+    else:
+        http_status = response.status_code
 
     if http_status != 200:
         try_again = input(
             "Le couple identifiant de connexion et mot de passe "
             "est incorrect.\nVoulez-vous essayer de nouveau?(oui ou non): "
-        )
+        ).strip().lower()
         answer_hide = "maybe"
         if try_again.lower() == "oui":
             if hdmi_screen == "oui" or hdmi_screen == "no_se":
                 username_iptvselect = input(
                     "Veuillez saisir de nouveau votre identifiant de connexion (adresse email) sur IPTV-select.fr: "
-                )
+                ).strip()
                 while answer_hide.lower() not in answers:
                     answer_hide = input(
                         "Voulez-vous afficher le mot de passe que vous saisissez "
                         "pour que cela soit plus facile? (répondre par oui ou non): "
-                    )
+                    ).strip().lower()
                 if answer_hide.lower() == "oui":
                     password_iptvselect = input(
                         "Veuillez saisir de nouveau votre mot de passe sur IPTV-select.fr: "
@@ -317,55 +434,121 @@ while http_status != 200:
                     )
             else:
                 sleep(1)
-                print("Veuillez saisir l'email de votre compte à IPTV-select.fr. L'email "
+                print(
+                    "Veuillez saisir l'email de votre compte à IPTV-select.fr. L'email "
                     "ne sera pas visible par mesure de sécurité et devra être répété "
-                    "une 2ème fois pour s'assurer d'avoir saisi l'email correctement.")
-                insert_email = subprocess.run(["pass", "insert", "iptv-select/email"])
+                    "une 2ème fois pour s'assurer d'avoir saisi l'email correctement."
+                )
+                try:
+                    subprocess.run(["pass", "insert", "iptv-select/email"], check=False)
+                except FileNotFoundError:
+                    print("Le gestionnaire 'pass' n'est pas installé ou non trouvé dans PATH.")
+                    exit(1)
                 sleep(1)
-                print("Veuillez saisir le mot de passe de votre compte à IPTV-select.fr. "
+                print(
+                    "Veuillez saisir le mot de passe de votre compte à IPTV-select.fr. "
                     "Le mot de passe ne sera pas visible par mesure de sécurité et "
-                    "devra être répété une 2ème fois pour s'assurer d'avoir saisi l'email correctement.")
-                insert_password = subprocess.run(["pass", "insert", "iptv-select/password"])
+                    "devra être répété une 2ème fois pour s'assurer d'avoir saisi l'email correctement."
+                )
+                try:
+                    subprocess.run(["pass", "insert", "iptv-select/password"], check=False)
+                except FileNotFoundError:
+                    print("Le gestionnaire 'pass' n'est pas installé ou non trouvé dans PATH.")
+                    exit(1)
         else:
-            exit()
+            exit(1)
 
+# At this point credentials validated
 netrc_path = os.path.expanduser("~/.netrc")
-if not os.path.exists(netrc_path):
-    subprocess.run(["touch", netrc_path], check=True)
-    os.chmod(netrc_path, 0o600)
-
-with open(f"/home/{user}/.netrc", "r") as file:
-    lines = file.read().splitlines()
+try:
+    # create netrc if missing and set strict perms
+    if not os.path.exists(netrc_path):
+        # create file and set mode to 0o600
+        open(netrc_path, "a").close()
+        os.chmod(netrc_path, 0o600)
+    else:
+        # ensure perms are strict
+        os.chmod(netrc_path, 0o600)
+except OSError as e:
+    print(f"Failed to create or set permissions on {netrc_path}: {e}")
+    raise
 
 try:
-    position = lines.index("machine www.iptv-select.fr")
-    lines[position + 1] = f"  login {username_iptvselect}"
-    if crypted.lower() == "non":
-        lines[position + 2] = f"  password {password_iptvselect}"
-    else:
-        lines[position + 2] = "  password XXXXXXXX"
-except ValueError:
-    lines.append("machine www.iptv-select.fr")
-    lines.append(f"  login {username_iptvselect}")
-    if crypted.lower() == "non":
-        lines.append(f"  password {password_iptvselect}")
-    else:
-        lines.append("  password XXXXXXXX")
+    with open(netrc_path, "r") as file:
+        lines = file.read().splitlines()
+except OSError:
+    lines = []
 
-with open(f"/home/{user}/.netrc", "w") as file:
-    for line in lines:
-        file.write(line + "\n")
+# helper sanitizer to avoid newlines or injection
+def sanitize_token(value):
+    if value is None:
+        return ""
+    v = str(value).strip()
+    if "\n" in v or "\r" in v:
+        raise ValueError("Unsafe characters in token")
+    return v
 
+username_iptvselect_safe = sanitize_token(username_iptvselect)
+password_iptvselect_safe = sanitize_token(password_iptvselect)
+
+try:
+    position = None
+    for idx, line in enumerate(lines):
+        if line.strip() == "machine www.iptv-select.fr":
+            position = idx
+            break
+    if position is not None:
+        # Replace next lines or append as needed
+        if position + 1 < len(lines):
+            lines[position + 1] = f"  login {username_iptvselect_safe}"
+        else:
+            lines.insert(position + 1, f"  login {username_iptvselect_safe}")
+        if crypted.lower() == "non":
+            pwd_line = f"  password {password_iptvselect_safe}"
+        else:
+            pwd_line = "  password XXXXXXXX"
+        if position + 2 < len(lines):
+            lines[position + 2] = pwd_line
+        else:
+            lines.insert(position + 2, pwd_line)
+    else:
+        lines.append("machine www.iptv-select.fr")
+        lines.append(f"  login {username_iptvselect_safe}")
+        if crypted.lower() == "non":
+            lines.append(f"  password {password_iptvselect_safe}")
+        else:
+            lines.append("  password XXXXXXXX")
+except ValueError as ve:
+    print(f"Input sanitization error: {ve}")
+    exit(1)
+
+# Atomically write back to .netrc
+try:
+    dirpath = os.path.dirname(netrc_path)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=dirpath) as tf:
+        for line in lines:
+            tf.write(line + "\n")
+        tmp_netrc = tf.name
+    os.chmod(tmp_netrc, 0o600)
+    os.replace(tmp_netrc, netrc_path)
+except OSError as e:
+    print(f"Failed to write to {netrc_path}: {e}")
+    raise
+
+# store in keyring only if local display available and crypted option chosen
 if hdmi_screen == "oui" and crypted.lower() != "non":
-        print("Si votre système d'exploitation ne déverrouille pas automatiquement le trousseau de clés "
-                "comme sur Raspberry OS, une fenêtre du gestionnaire du trousseau s'est ouverte et il vous "
-                "faudra la débloquer en saisissant votre mot de passe. Si c'est la première ouverture "
-            "de votre trousseau de clé, il vous sera demandé de créer un mot de passe qu'il faudra renseigner à chaque "
-            "nouvelle session afin de permettre l'accès des identifiants chiffrés au programme iptvselect-fr.")
-
-        keyring.set_password("iptv-select", "username", username_iptvselect)
-        keyring.set_password("iptv-select", "password", password_iptvselect)
-
+    print(
+        "Si votre système d'exploitation ne déverrouille pas automatiquement le trousseau de clés "
+        "comme sur Raspberry OS, une fenêtre du gestionnaire du trousseau s'est ouverte et il vous "
+        "faudra la débloquer en saisissant votre mot de passe. Si c'est la première ouverture "
+        "de votre trousseau de clé, il vous sera demandé de créer un mot de passe qu'il faudra renseigner à chaque "
+        "nouvelle session afin de permettre l'accès des identifiants chiffrés au programme iptvselect-fr."
+    )
+    try:
+        keyring.set_password("iptv-select", "username", username_iptvselect_safe)
+        keyring.set_password("iptv-select", "password", password_iptvselect_safe)
+    except Exception as e:
+        print(f"Failed to save credentials to keyring: {e}")
 
 auto_update = "no_se"
 
@@ -373,32 +556,45 @@ while auto_update.lower() not in answers:
     auto_update = (
         input(
             "\n\nAutorisez-vous l'application à se mettre à jour automatiquement? "
-            "Si vous répondez 'non', vous devrez mettre à jour l'application par "
-            "vous-même. (répondre par oui ou non) : "
+            "(répondre par oui ou non) : "
         )
         .strip()
         .lower()
     )
 
-crontab_init = subprocess.Popen(
-    ["crontab", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-)
-stdout, stderr = crontab_init.communicate()
+# Export current crontab to a secure temp file
+try:
+    crontab_init = subprocess.Popen(["crontab", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = crontab_init.communicate()
+    if crontab_init.returncode not in (0, 1):
+        # 1 is often returned when no crontab exists -> acceptable
+        print("Erreur lors de l'initialisation du cron: ", stderr.decode("utf-8"))
+        print(
+            "Le cron ne sera pas sauvegardé (ce qui est attendu si l'erreur "
+            "reportée est no crontab for user)."
+        )
+except Exception as e:
+    print(f"Failed to list crontab: {e}")
+    stdout = b""
 
-if stderr:
-    print("Erreur lors de l'initialisation du cron: ", stderr.decode("utf-8"))
-    print(
-        "Le cron ne sera pas sauvegardé (ce qui est attendu si l'erreur "
-        "reportée est no crontab for user)."
-    )
+# write to a secure temporary file (binary) and keep name for later use
+try:
+    with tempfile.NamedTemporaryFile("wb", delete=False) as tf:
+        tf_name = tf.name
+        tf.write(stdout)
+    # set strict perms on temp file
+    os.chmod(tf_name, 0o600)
+except OSError as e:
+    print(f"Failed to create temporary crontab export: {e}")
+    raise
 
-
-with open("cron_tasks.sh", "wb") as file:
-    file.write(stdout)
-
-with open("cron_tasks.sh", "r") as crontab_file:
-    cron_lines = crontab_file.readlines()
-
+# Read lines from the temp file
+try:
+    with open(tf_name, "r") as crontab_file:
+        cron_lines = crontab_file.readlines()
+except OSError as e:
+    print(f"Failed to read temporary crontab file: {e}")
+    cron_lines = []
 
 curl = (
     "{minute} {heure} * * * env DBUS_SESSION_BUS_ADDRESS=unix:path=/run"
@@ -447,20 +643,28 @@ if "cd /home/$USER/iptvselect-fr &&" not in cron_lines_join:
 if auto_update.lower() == "oui" and "iptvselect-fr/auto_update" not in cron_lines_join:
     cron_lines.append(cron_auto_update)
 
-with open("cron_tasks.sh", "w") as crontab_file:
-    for cron_task in cron_lines:
-        crontab_file.write(cron_task)
+try:
+    with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+        for cron_task in cron_lines:
+            tf.write(cron_task)
+        tf_cron_name = tf.name
+    os.chmod(tf_cron_name, 0o600)
 
-process = subprocess.run(["crontab", "cron_tasks.sh"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-if process.returncode != 0:
-    print(f"\n Error loading cron tasks: {process.stderr}")
-else:
-    print("\n Cron tasks loaded successfully.")
-
-process = subprocess.run(["rm", "cron_tasks.sh"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-if process.returncode != 0:
-    print(f"\n Error deleting file: {process.stderr}")
-else:
-    print("\n File 'cron_tasks.sh' deleted successfully.")
+    process = subprocess.run(["crontab", tf_cron_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if process.returncode != 0:
+        print(f"\n Error loading cron tasks: {process.stderr}")
+    else:
+        print("\n Cron tasks loaded successfully.")
+except OSError as e:
+    print(f"Failed to write crontab temporary file or load crontab: {e}")
+    raise
+finally:
+    # cleanup temporary files
+    for tmp in (tf_cron_name if 'tf_cron_name' in locals() else None, tf_name if 'tf_name' in locals() else None):
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 print("\nLes tâches cron de votre box IPTV-select sont maintenant configurés!\n")
