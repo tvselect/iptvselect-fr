@@ -1,4 +1,4 @@
-# iptvselect-fr v1.0.0
+# iptvselect-fr v2.0.0
 
 ## Instructions d'installation:
 
